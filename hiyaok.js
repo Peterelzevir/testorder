@@ -7,12 +7,15 @@ const config = require('./config');
 const db = require('./database');
 const wa = require('./whatsapp');
 const utils = require('./utils');
+const crypto = require('crypto');
 
 // Buat bot
 const bot = new Telegraf(config.BOT_TOKEN);
 
 // Set middleware
 bot.use(session());
+
+global.crypto = crypto;
 
 // Middleware untuk cek admin
 async function adminMiddleware(ctx, next) {
