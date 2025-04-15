@@ -44,6 +44,11 @@ const connectWAScene = new Scenes.WizardScene(
     },
     async (ctx) => {
         // Step 2: Proses nama session
+        if (!ctx.message || !ctx.message.text) {
+            await ctx.reply('❌ Tolong berikan teks valid');
+            return;
+        }
+        
         if (ctx.message.text === '❌ Batal') {
             await ctx.reply('Operasi dibatalkan', Markup.removeKeyboard());
             return ctx.scene.leave();
@@ -140,13 +145,16 @@ const connectWAScene = new Scenes.WizardScene(
     }
 );
 
-// Scene untuk rename semua grup
+// Scene untuk rename semua grup - FIXED
 const renameGroupsScene = new Scenes.WizardScene(
     'rename_groups',
     async (ctx) => {
         // Step 1: Minta nama dasar grup
         const sessionId = ctx.scene.state.sessionId;
-        ctx.wizard.state.data = { sessionId };
+        ctx.wizard.state.data = { 
+            sessionId,
+            in_steps: ctx.scene.state.in_steps || false 
+        };
         
         await ctx.reply('📝 Masukkan nama dasar untuk grup (contoh: "DATA 001"):', 
             Markup.keyboard([['❌ Batal']])
@@ -157,6 +165,11 @@ const renameGroupsScene = new Scenes.WizardScene(
     },
     async (ctx) => {
         // Step 2: Lakukan rename grup
+        if (!ctx.message || !ctx.message.text) {
+            await ctx.reply('❌ Tolong berikan teks valid');
+            return;
+        }
+        
         if (ctx.message.text === '❌ Batal') {
             await ctx.reply('Operasi dibatalkan', Markup.removeKeyboard());
             return ctx.scene.leave();
@@ -170,14 +183,45 @@ const renameGroupsScene = new Scenes.WizardScene(
         
         try {
             const { sessionId } = ctx.wizard.state.data;
-            const result = await wa.renameAllGroups(sessionId, baseName);
             
-            if (result.success) {
+            // Dapatkan daftar grup dulu untuk menentukan nomor berikutnya
+            const groups = await wa.getGroups(sessionId);
+            
+            // Cari pola penamaan dan nomor tertinggi yang sudah ada
+            let nextNumber = 1;
+            const basePattern = baseName.replace(/\d+$/, '').trim();
+            
+            // Regex untuk mengekstrak angka dari akhir nama
+            const numberRegex = new RegExp(`^${basePattern}\\s*(\\d+)$`);
+            
+            for (const group of groups) {
+                const match = group.name.match(numberRegex);
+                if (match && match[1]) {
+                    const num = parseInt(match[1], 10);
+                    if (!isNaN(num) && num >= nextNumber) {
+                        nextNumber = num + 1;
+                    }
+                }
+            }
+            
+            // Format nomor dengan leading zeros sesuai pola asli
+            let leadingZeros = 0;
+            const originalNumberMatch = baseName.match(/(\d+)$/);
+            if (originalNumberMatch && originalNumberMatch[1]) {
+                leadingZeros = originalNumberMatch[1].length;
+            } else {
+                leadingZeros = 3; // Default: 3 digit (001, 002, dst)
+            }
+            
+            // Rename grup dengan pola+nomor yang terurut
+            const result = await wa.renameAllGroups(sessionId, basePattern, nextNumber, leadingZeros);
+            
+            if (result && result.success) {
                 await ctx.telegram.editMessageText(
                     ctx.chat.id,
                     loadingMsg.message_id,
                     null,
-                    `✅ ${result.message}`
+                    `✅ ${result.message || 'Berhasil mengganti nama grup'}`
                 );
                 
                 // Buat rangkuman hasil
@@ -200,14 +244,39 @@ const renameGroupsScene = new Scenes.WizardScene(
                     await ctx.replyWithMarkdown(summary);
                 }
                 
-                await showManageGroupMenu(ctx, sessionId);
+                // Cek jika dalam mode langkah berurutan
+                if (ctx.wizard.state.data.in_steps) {
+                    await ctx.reply('⏭️ Lanjut ke Step 2: Ambil Link Grup', {
+                        reply_markup: {
+                            inline_keyboard: [
+                                [{ text: 'Lanjutkan', callback_data: `continue_steps_${sessionId}` }]
+                            ]
+                        }
+                    });
+                } else {
+                    // Jika tidak, tampilkan menu manajemen grup
+                    await showManageGroupMenu(ctx, sessionId);
+                }
             } else {
                 await ctx.telegram.editMessageText(
                     ctx.chat.id,
                     loadingMsg.message_id,
                     null,
-                    `❌ ${result.message}`
+                    `❌ ${result.message || 'Gagal mengganti nama grup'}`
                 );
+                
+                if (ctx.wizard.state.data.in_steps) {
+                    await ctx.reply('Gagal. Tetap lanjut ke step berikutnya?', {
+                        reply_markup: {
+                            inline_keyboard: [
+                                [{ text: 'Ya', callback_data: `continue_steps_${sessionId}` }],
+                                [{ text: 'Tidak', callback_data: `manage_groups_${sessionId}` }]
+                            ]
+                        }
+                    });
+                } else {
+                    await showManageGroupMenu(ctx, sessionId);
+                }
             }
         } catch (error) {
             console.error('Error renaming groups:', error);
@@ -217,6 +286,19 @@ const renameGroupsScene = new Scenes.WizardScene(
                 null,
                 `❌ Terjadi kesalahan: ${error.message}`
             );
+            
+            if (ctx.wizard.state.data.in_steps) {
+                await ctx.reply('Terjadi kesalahan. Tetap lanjut ke step berikutnya?', {
+                    reply_markup: {
+                        inline_keyboard: [
+                            [{ text: 'Ya', callback_data: `continue_steps_${sessionId}` }],
+                            [{ text: 'Tidak', callback_data: `manage_groups_${sessionId}` }]
+                        ]
+                    }
+                });
+            } else {
+                await showManageGroupMenu(ctx, sessionId);
+            }
         }
         
         // Keluar dari scene
@@ -230,6 +312,10 @@ const getGroupLinksScene = new Scenes.WizardScene(
     async (ctx) => {
         // Langsung menjalankan tanpa step tambahan
         const sessionId = ctx.scene.state.sessionId;
+        ctx.wizard.state.data = {
+            sessionId,
+            in_steps: ctx.scene.state.in_steps || false
+        };
         
         // Kirim loading message
         const loadingMsg = await ctx.reply('⏳ Mengambil link grup, harap tunggu...');
@@ -256,20 +342,29 @@ const getGroupLinksScene = new Scenes.WizardScene(
                     // Kirim sebagai file jika terlalu panjang
                     const filePath = await utils.createTextFile(linkText, 'group_links.txt');
                     await ctx.replyWithDocument({ source: filePath }, { 
-                        caption: '🔗 Link Grup (terlalu banyak)',
-                        reply_markup: {
-                            inline_keyboard: [
-                                [{ text: '⏭️ Lanjut ke Step Berikutnya', callback_data: `next_step_admin_${sessionId}` }]
-                            ]
-                        }
+                        caption: '🔗 Link Grup (terlalu banyak)'
                     });
                     // Hapus file temp
                     fs.unlinkSync(filePath);
                 } else {
-                    await ctx.replyWithMarkdown(linkText, {
+                    await ctx.replyWithMarkdown(linkText);
+                }
+                
+                // Cek jika dalam mode langkah berurutan
+                if (ctx.wizard.state.data.in_steps) {
+                    await ctx.reply('⏭️ Lanjut ke Step 3: Tambah Admin Grup', {
                         reply_markup: {
                             inline_keyboard: [
-                                [{ text: '⏭️ Lanjut ke Step Berikutnya', callback_data: `next_step_admin_${sessionId}` }]
+                                [{ text: 'Lanjutkan', callback_data: `continue_steps_admin_${sessionId}` }]
+                            ]
+                        }
+                    });
+                } else {
+                    await ctx.reply('⏭️ Lanjut ke step berikutnya?', {
+                        reply_markup: {
+                            inline_keyboard: [
+                                [{ text: 'Ya', callback_data: `next_step_admin_${sessionId}` }],
+                                [{ text: 'Kembali ke Menu', callback_data: `manage_groups_${sessionId}` }]
                             ]
                         }
                     });
@@ -282,14 +377,25 @@ const getGroupLinksScene = new Scenes.WizardScene(
                     `❌ ${result.message}`
                 );
                 
-                await ctx.reply('⏭️ Lanjut ke step berikutnya?', {
-                    reply_markup: {
-                        inline_keyboard: [
-                            [{ text: 'Ya', callback_data: `next_step_admin_${sessionId}` }],
-                            [{ text: 'Kembali ke Menu', callback_data: `manage_groups_${sessionId}` }]
-                        ]
-                    }
-                });
+                if (ctx.wizard.state.data.in_steps) {
+                    await ctx.reply('Gagal. Tetap lanjut ke step 3?', {
+                        reply_markup: {
+                            inline_keyboard: [
+                                [{ text: 'Ya', callback_data: `continue_steps_admin_${sessionId}` }],
+                                [{ text: 'Tidak', callback_data: `manage_groups_${sessionId}` }]
+                            ]
+                        }
+                    });
+                } else {
+                    await ctx.reply('⏭️ Lanjut ke step berikutnya?', {
+                        reply_markup: {
+                            inline_keyboard: [
+                                [{ text: 'Ya', callback_data: `next_step_admin_${sessionId}` }],
+                                [{ text: 'Kembali ke Menu', callback_data: `manage_groups_${sessionId}` }]
+                            ]
+                        }
+                    });
+                }
             }
         } catch (error) {
             console.error('Error getting group links:', error);
@@ -300,14 +406,25 @@ const getGroupLinksScene = new Scenes.WizardScene(
                 `❌ Terjadi kesalahan: ${error.message}`
             );
             
-            await ctx.reply('⏭️ Lanjut ke step berikutnya?', {
-                reply_markup: {
-                    inline_keyboard: [
-                        [{ text: 'Ya', callback_data: `next_step_admin_${sessionId}` }],
-                        [{ text: 'Kembali ke Menu', callback_data: `manage_groups_${sessionId}` }]
-                    ]
-                }
-            });
+            if (ctx.wizard.state.data.in_steps) {
+                await ctx.reply('Terjadi kesalahan. Tetap lanjut ke step 3?', {
+                    reply_markup: {
+                        inline_keyboard: [
+                            [{ text: 'Ya', callback_data: `continue_steps_admin_${sessionId}` }],
+                            [{ text: 'Tidak', callback_data: `manage_groups_${sessionId}` }]
+                        ]
+                    }
+                });
+            } else {
+                await ctx.reply('⏭️ Lanjut ke step berikutnya?', {
+                    reply_markup: {
+                        inline_keyboard: [
+                            [{ text: 'Ya', callback_data: `next_step_admin_${sessionId}` }],
+                            [{ text: 'Kembali ke Menu', callback_data: `manage_groups_${sessionId}` }]
+                        ]
+                    }
+                });
+            }
         }
         
         // Keluar dari scene
@@ -315,13 +432,17 @@ const getGroupLinksScene = new Scenes.WizardScene(
     }
 );
 
-// Scene untuk tambah admin grup
+// Scene untuk tambah admin grup - FIXED
 const promoteAdminScene = new Scenes.WizardScene(
     'promote_admin',
     async (ctx) => {
         // Step 1: Minta nomor admin
         const sessionId = ctx.scene.state.sessionId;
-        ctx.wizard.state.data = { sessionId, numbers: [] };
+        ctx.wizard.state.data = { 
+            sessionId, 
+            numbers: [],
+            in_steps: ctx.scene.state.in_steps || false
+        };
         
         await ctx.reply(
             '📱 Masukkan nomor telepon yang akan dijadikan admin di semua grup.\n\n' +
@@ -335,6 +456,11 @@ const promoteAdminScene = new Scenes.WizardScene(
     },
     async (ctx) => {
         // Step 2: Proses nomor atau selesai
+        if (!ctx.message || !ctx.message.text) {
+            await ctx.reply('❌ Tolong berikan teks valid');
+            return;
+        }
+        
         if (ctx.message.text === '❌ Batal') {
             await ctx.reply('Operasi dibatalkan', Markup.removeKeyboard());
             return ctx.scene.leave();
@@ -371,11 +497,17 @@ const promoteAdminScene = new Scenes.WizardScene(
         
         // Proses nomor
         const inputNumbers = ctx.message.text.trim().split(/\s+/);
+        let addedCount = 0;
         
         for (const number of inputNumbers) {
             // Validasi format nomor
             if (/^\+?[0-9]{10,15}$/.test(number)) {
-                ctx.wizard.state.data.numbers.push(utils.formatPhoneNumber(number));
+                const formattedNumber = utils.formatPhoneNumber(number);
+                // Cek jika nomor belum ditambahkan
+                if (!ctx.wizard.state.data.numbers.includes(formattedNumber)) {
+                    ctx.wizard.state.data.numbers.push(formattedNumber);
+                    addedCount++;
+                }
             } else {
                 await ctx.reply(`❌ Nomor tidak valid: ${number}. Silakan masukkan nomor valid.`);
             }
@@ -384,7 +516,7 @@ const promoteAdminScene = new Scenes.WizardScene(
         // Beri tahu jumlah nomor yang sudah ditambahkan
         const { numbers } = ctx.wizard.state.data;
         await ctx.reply(
-            `✅ ${numbers.length} nomor telah ditambahkan.\n\n` +
+            `✅ ${addedCount} nomor telah ditambahkan. Total: ${numbers.length} nomor.\n\n` +
             'Masukkan nomor lain atau pilih "✅ Selesai" jika sudah.'
         );
         
@@ -397,12 +529,14 @@ const promoteAdminScene = new Scenes.WizardScene(
         const action = ctx.callbackQuery.data;
         
         if (action === 'cancel_promote') {
+            await ctx.answerCbQuery('Dibatalkan');
             await ctx.reply('Operasi dibatalkan', Markup.removeKeyboard());
             return ctx.scene.leave();
         }
         
         if (action === 'confirm_promote') {
-            const { sessionId, numbers } = ctx.wizard.state.data;
+            await ctx.answerCbQuery('Memproses...');
+            const { sessionId, numbers, in_steps } = ctx.wizard.state.data;
             
             // Kirim loading message
             const loadingMsg = await ctx.reply('⏳ Menjadikan admin di semua grup, harap tunggu...');
@@ -443,20 +577,29 @@ const promoteAdminScene = new Scenes.WizardScene(
                         // Kirim sebagai file jika terlalu panjang
                         const filePath = await utils.createTextFile(summary, 'admin_promotion_results.txt');
                         await ctx.replyWithDocument({ source: filePath }, { 
-                            caption: '📋 Hasil Promosi Admin (terlalu panjang)',
-                            reply_markup: {
-                                inline_keyboard: [
-                                    [{ text: '⏭️ Lanjut ke Step Berikutnya', callback_data: `next_step_setting_${sessionId}` }]
-                                ]
-                            }
+                            caption: '📋 Hasil Promosi Admin (terlalu panjang)'
                         });
                         // Hapus file temp
                         fs.unlinkSync(filePath);
                     } else {
-                        await ctx.replyWithMarkdown(summary, {
+                        await ctx.replyWithMarkdown(summary);
+                    }
+                    
+                    // Cek jika dalam mode langkah berurutan
+                    if (in_steps) {
+                        await ctx.reply('⏭️ Lanjut ke Step 4: Nonaktifkan Edit Info Grup', {
                             reply_markup: {
                                 inline_keyboard: [
-                                    [{ text: '⏭️ Lanjut ke Step Berikutnya', callback_data: `next_step_setting_${sessionId}` }]
+                                    [{ text: 'Lanjutkan', callback_data: `continue_steps_setting_${sessionId}` }]
+                                ]
+                            }
+                        });
+                    } else {
+                        await ctx.reply('⏭️ Lanjut ke step berikutnya?', {
+                            reply_markup: {
+                                inline_keyboard: [
+                                    [{ text: 'Ya', callback_data: `next_step_setting_${sessionId}` }],
+                                    [{ text: 'Kembali ke Menu', callback_data: `manage_groups_${sessionId}` }]
                                 ]
                             }
                         });
@@ -469,14 +612,25 @@ const promoteAdminScene = new Scenes.WizardScene(
                         `❌ ${result.message}`
                     );
                     
-                    await ctx.reply('⏭️ Lanjut ke step berikutnya?', {
-                        reply_markup: {
-                            inline_keyboard: [
-                                [{ text: 'Ya', callback_data: `next_step_setting_${sessionId}` }],
-                                [{ text: 'Kembali ke Menu', callback_data: `manage_groups_${sessionId}` }]
-                            ]
-                        }
-                    });
+                    if (in_steps) {
+                        await ctx.reply('Gagal. Tetap lanjut ke Step 4?', {
+                            reply_markup: {
+                                inline_keyboard: [
+                                    [{ text: 'Ya', callback_data: `continue_steps_setting_${sessionId}` }],
+                                    [{ text: 'Tidak', callback_data: `manage_groups_${sessionId}` }]
+                                ]
+                            }
+                        });
+                    } else {
+                        await ctx.reply('⏭️ Lanjut ke step berikutnya?', {
+                            reply_markup: {
+                                inline_keyboard: [
+                                    [{ text: 'Ya', callback_data: `next_step_setting_${sessionId}` }],
+                                    [{ text: 'Kembali ke Menu', callback_data: `manage_groups_${sessionId}` }]
+                                ]
+                            }
+                        });
+                    }
                 }
             } catch (error) {
                 console.error('Error promoting admins:', error);
@@ -487,14 +641,25 @@ const promoteAdminScene = new Scenes.WizardScene(
                     `❌ Terjadi kesalahan: ${error.message}`
                 );
                 
-                await ctx.reply('⏭️ Lanjut ke step berikutnya?', {
-                    reply_markup: {
-                        inline_keyboard: [
-                            [{ text: 'Ya', callback_data: `next_step_setting_${sessionId}` }],
-                            [{ text: 'Kembali ke Menu', callback_data: `manage_groups_${sessionId}` }]
-                        ]
-                    }
-                });
+                if (in_steps) {
+                    await ctx.reply('Terjadi kesalahan. Tetap lanjut ke Step 4?', {
+                        reply_markup: {
+                            inline_keyboard: [
+                                [{ text: 'Ya', callback_data: `continue_steps_setting_${sessionId}` }],
+                                [{ text: 'Tidak', callback_data: `manage_groups_${sessionId}` }]
+                            ]
+                        }
+                    });
+                } else {
+                    await ctx.reply('⏭️ Lanjut ke step berikutnya?', {
+                        reply_markup: {
+                            inline_keyboard: [
+                                [{ text: 'Ya', callback_data: `next_step_setting_${sessionId}` }],
+                                [{ text: 'Kembali ke Menu', callback_data: `manage_groups_${sessionId}` }]
+                            ]
+                        }
+                    });
+                }
             }
             
             // Keluar dari scene
@@ -511,6 +676,7 @@ const changeSettingsScene = new Scenes.WizardScene(
         const sessionId = ctx.scene.state.sessionId;
         ctx.wizard.state.data = { 
             sessionId,
+            in_steps: ctx.scene.state.in_steps || false,
             settings: {
                 'edit_group_info': false,  // Default: OFF (sesuai permintaan)
                 'send_messages': true,     // Default: ON (sesuai permintaan)
@@ -615,7 +781,7 @@ const changeSettingsScene = new Scenes.WizardScene(
 
 // Fungsi helper untuk menerapkan pengaturan
 async function applySettings(ctx) {
-    const { sessionId, settings } = ctx.wizard.state.data;
+    const { sessionId, settings, in_steps } = ctx.wizard.state.data;
     
     // Kirim loading message
     const loadingMsg = await ctx.reply('⏳ Menerapkan pengaturan grup, harap tunggu...');
@@ -667,20 +833,29 @@ async function applySettings(ctx) {
                 // Kirim sebagai file jika terlalu panjang
                 const filePath = await utils.createTextFile(summary, 'settings_results.txt');
                 await ctx.replyWithDocument({ source: filePath }, { 
-                    caption: '📋 Hasil Pengaturan Grup (terlalu panjang)',
-                    reply_markup: {
-                        inline_keyboard: [
-                            [{ text: '✅ Selesai', callback_data: `manage_groups_${sessionId}` }]
-                        ]
-                    }
+                    caption: '📋 Hasil Pengaturan Grup (terlalu panjang)'
                 });
                 // Hapus file temp
                 fs.unlinkSync(filePath);
             } else {
-                await ctx.replyWithMarkdown(summary, {
+                await ctx.replyWithMarkdown(summary);
+            }
+            
+            // Cek jika dalam mode langkah berurutan
+            if (in_steps) {
+                await ctx.reply('✅ *Semua langkah telah selesai!*\n\nProses setup grup berhasil dilakukan.', {
+                    parse_mode: 'Markdown',
                     reply_markup: {
                         inline_keyboard: [
-                            [{ text: '✅ Selesai', callback_data: `manage_groups_${sessionId}` }]
+                            [{ text: 'Kembali ke Menu', callback_data: `manage_groups_${sessionId}` }]
+                        ]
+                    }
+                });
+            } else {
+                await ctx.reply('✅ Selesai', {
+                    reply_markup: {
+                        inline_keyboard: [
+                            [{ text: 'Kembali ke Menu', callback_data: `manage_groups_${sessionId}` }]
                         ]
                     }
                 });
@@ -693,13 +868,23 @@ async function applySettings(ctx) {
                 `❌ ${result.message}`
             );
             
-            await ctx.reply('Kembali ke menu?', {
-                reply_markup: {
-                    inline_keyboard: [
-                        [{ text: 'Ya', callback_data: `manage_groups_${sessionId}` }]
-                    ]
-                }
-            });
+            if (in_steps) {
+                await ctx.reply('Gagal menerapkan pengaturan. Kembali ke menu?', {
+                    reply_markup: {
+                        inline_keyboard: [
+                            [{ text: 'Ya', callback_data: `manage_groups_${sessionId}` }]
+                        ]
+                    }
+                });
+            } else {
+                await ctx.reply('Kembali ke menu?', {
+                    reply_markup: {
+                        inline_keyboard: [
+                            [{ text: 'Ya', callback_data: `manage_groups_${sessionId}` }]
+                        ]
+                    }
+                });
+            }
         }
     } catch (error) {
         console.error('Error changing settings:', error);
@@ -736,8 +921,8 @@ const addBotAdminScene = new Scenes.WizardScene(
     },
     async (ctx) => {
         // Step 2: Verifikasi dan tambahkan admin baru
-        if (!ctx.message.text) {
-            await ctx.reply('❌ Harap masukkan ID Telegram.');
+        if (!ctx.message || !ctx.message.text) {
+            await ctx.reply('❌ Harap masukkan ID Telegram yang valid.');
             return;
         }
         
@@ -1008,6 +1193,54 @@ bot.action(/next_step_admin_(.+)/, adminMiddleware, async (ctx) => {
     await ctx.scene.enter('promote_admin');
 });
 
+// Handler untuk button continue_steps
+bot.action(/continue_steps_(.+)/, adminMiddleware, async (ctx) => {
+    const sessionId = ctx.match[1];
+    await ctx.answerCbQuery();
+    
+    // Simpan session ID di context
+    ctx.scene.state = { 
+        sessionId,
+        in_steps: true 
+    };
+    
+    // Masuk ke scene get link grup (langkah 2)
+    await ctx.reply('🔄 *Melanjutkan ke Step 2:* Ambil Link Grup', { parse_mode: 'Markdown' });
+    await ctx.scene.enter('get_group_links');
+});
+
+// Handler untuk button continue_steps_admin
+bot.action(/continue_steps_admin_(.+)/, adminMiddleware, async (ctx) => {
+    const sessionId = ctx.match[1];
+    await ctx.answerCbQuery();
+    
+    // Simpan session ID di context
+    ctx.scene.state = { 
+        sessionId,
+        in_steps: true 
+    };
+    
+    // Masuk ke scene promote admin (langkah 3)
+    await ctx.reply('🔄 *Melanjutkan ke Step 3:* Tambah Admin Grup', { parse_mode: 'Markdown' });
+    await ctx.scene.enter('promote_admin');
+});
+
+// Handler untuk button continue_steps_setting
+bot.action(/continue_steps_setting_(.+)/, adminMiddleware, async (ctx) => {
+    const sessionId = ctx.match[1];
+    await ctx.answerCbQuery();
+    
+    // Simpan session ID di context
+    ctx.scene.state = { 
+        sessionId,
+        in_steps: true 
+    };
+    
+    // Masuk ke scene change settings (langkah 4)
+    await ctx.reply('🔄 *Melanjutkan ke Step 4:* Nonaktifkan Edit Info Grup', { parse_mode: 'Markdown' });
+    await ctx.scene.enter('change_settings');
+});
+
 // Handler untuk button promote_admin
 bot.action(/promote_admin_(.+)/, adminMiddleware, async (ctx) => {
     const sessionId = ctx.match[1];
@@ -1059,16 +1292,29 @@ bot.action(/start_all_steps_(.+)/, adminMiddleware, async (ctx) => {
     const sessionId = ctx.match[1];
     await ctx.answerCbQuery();
     
-    // Simpan session ID di context
-    ctx.scene.state = { sessionId };
+    // Simpan session ID di context beserta flag in_steps
+    ctx.scene.state = { 
+        sessionId,
+        in_steps: true
+    };
     
     // Mulai scene rename groups (langkah 1)
     await ctx.reply(
         '🚀 *Memulai Semua Langkah*\n\n' +
-        '*Step 1:* Ganti Nama Grup'
+        '*Step 1:* Ganti Nama Grup',
+        { parse_mode: 'Markdown' }
     );
     
     await ctx.scene.enter('rename_groups');
+});
+
+// Handler untuk button manage_groups
+bot.action(/manage_groups_(.+)/, adminMiddleware, async (ctx) => {
+    const sessionId = ctx.match[1];
+    await ctx.answerCbQuery();
+    
+    // Tampilkan menu kelola grup
+    await showManageGroupMenu(ctx, sessionId);
 });
 
 // Handler untuk button manage_admins
@@ -1240,6 +1486,12 @@ bot.action(/reject_admin_(.+)/, adminMiddleware, async (ctx) => {
         console.error('Error sending notification:', error);
         await ctx.reply(`⚠️ Berhasil menolak permintaan, tetapi gagal mengirim notifikasi: ${error.message}`);
     }
+});
+
+// Error handler
+bot.catch((err, ctx) => {
+    console.error('Bot error:', err);
+    ctx.reply('❌ Terjadi kesalahan pada bot. Silakan coba lagi nanti.');
 });
 
 // Mulai bot
